@@ -19,6 +19,9 @@
   },
   "main": "./dist/index.mjs",
   "types": "./dist/index.d.mts",
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "prepare": "husky",
     "postinstall": "tsdown",
