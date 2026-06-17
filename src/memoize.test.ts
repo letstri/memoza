@@ -139,6 +139,49 @@ describe('memoize', () => {
       expect(fn(2, 1)).toBe(3)
       expect(callback).toHaveBeenCalledTimes(3)
     })
+
+    it('treats a static string as a constant key for every call', () => {
+      const callback = mock((x: number) => x * 2)
+      const fn = memoize(callback, { cacheKey: 'constant' })
+
+      expect(fn(5)).toBe(10)
+      expect(fn(10)).toBe(10)
+      expect(fn(99)).toBe(10)
+      expect(callback).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps separate caches for instances with different static keys', () => {
+      const callback = mock((x: number) => x * 2)
+      const first = memoize(callback, { cacheKey: 'a' })
+      const second = memoize(callback, { cacheKey: 'b' })
+
+      expect(first(5)).toBe(10)
+      expect(second(7)).toBe(14)
+      expect(first(123)).toBe(10)
+      expect(second(456)).toBe(14)
+      expect(callback).toHaveBeenCalledTimes(2)
+    })
+
+    it('recomputes a static-string key after maxAge', () => {
+      let now = 1000
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        const callback = mock((x: number) => x * 2)
+        const fn = memoize(callback, { cacheKey: 'constant', maxAge: 50 })
+
+        expect(fn(5)).toBe(10)
+        expect(callback).toHaveBeenCalledTimes(1)
+
+        now += 51
+        expect(fn(5)).toBe(10)
+        expect(callback).toHaveBeenCalledTimes(2)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
   })
 
   describe('promise handling', () => {

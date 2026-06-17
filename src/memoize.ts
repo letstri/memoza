@@ -20,8 +20,10 @@ export interface MemoizeOptions<F extends AnyFunction> {
    * fn(1, 5) // Stored
    * fn(1, 7) // From cache
    * ```
+   *
+   * A static string can also be provided to always resolve to the same key.
    */
-  cacheKey?: (...args: Parameters<F>) => unknown
+  cacheKey?: ((...args: Parameters<F>) => unknown) | string
 }
 
 export interface MemoizedCacheEntry<F extends AnyFunction> {
@@ -59,11 +61,13 @@ export function memoize<F extends AnyFunction>(
   const fallbackEntries: MemoizedEntry<F>[] = []
 
   const fn = ((...params: Parameters<F>) => {
-    const args = cacheKey
-      ? cacheKey(...params)
-      : params.length === 1
+    const args = cacheKey === undefined
+      ? params.length === 1
         ? params[0]
         : params
+      : typeof cacheKey === 'function'
+        ? cacheKey(...params)
+        : cacheKey
 
     const key = getCacheKey(args)
 
