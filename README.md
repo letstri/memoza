@@ -73,23 +73,23 @@ Measured with Bun on Apple Silicon. All suites run 5 trials; results show the me
 
 | Library | Median throughput | vs fastest |
 |---|---|---|
-| lodash.memoize | 26,757,903 ops/s | 1.00x |
-| @emotion/memoize | 25,235,597 ops/s | 1.06x |
-| memoize | 21,285,854 ops/s | 1.26x |
-| **memoza** | **9,518,722 ops/s** | **2.81x** |
-| @formatjs/fast-memoize | 3,455,674 ops/s | 7.74x |
-| memoizee | 2,171,950 ops/s | 12.32x |
+| lodash.memoize | 35,888,940 ops/s | 1.00x |
+| @emotion/memoize | 34,853,720 ops/s | 1.03x |
+| **memoza** | **27,481,277 ops/s** | **1.31x** |
+| memoize | 26,647,143 ops/s | 1.35x |
+| @formatjs/fast-memoize | 4,234,950 ops/s | 8.47x |
+| memoizee | 2,338,527 ops/s | 15.35x |
 
 ### Unary string argument — cold misses
 
 | Library | Median throughput | vs fastest |
 |---|---|---|
-| lodash.memoize | 8,017,102 ops/s | 1.00x |
-| @emotion/memoize | 7,289,737 ops/s | 1.10x |
-| memoize | 7,273,345 ops/s | 1.10x |
-| @formatjs/fast-memoize | 2,126,543 ops/s | 3.77x |
-| **memoza** | **2,066,386 ops/s** | **3.88x** |
-| memoizee | 6,370 ops/s | 1258.53x |
+| lodash.memoize | 10,767,258 ops/s | 1.00x |
+| @emotion/memoize | 9,905,814 ops/s | 1.09x |
+| **memoza** | **8,125,567 ops/s** | **1.33x** |
+| memoize | 7,774,187 ops/s | 1.39x |
+| @formatjs/fast-memoize | 3,306,131 ops/s | 3.26x |
+| memoizee | 6,810 ops/s | 1581.20x |
 
 ### Two primitive arguments — hot cache hits
 
@@ -97,11 +97,11 @@ Libraries requiring multi-arg support are configured with `JSON.stringify` or an
 
 | Library | Median throughput | vs fastest |
 |---|---|---|
-| memoize (cacheKey: JSON.stringify) | 8,248,268 ops/s | 1.00x |
-| lodash.memoize (resolver) | 6,853,923 ops/s | 1.20x |
-| memoizee | 6,642,644 ops/s | 1.24x |
-| **memoza** | **3,898,087 ops/s** | **2.12x** |
-| @formatjs/fast-memoize | 2,678,101 ops/s | 3.08x |
+| memoize (cacheKey: JSON.stringify) | 11,655,569 ops/s | 1.00x |
+| lodash.memoize (resolver) | 8,959,021 ops/s | 1.30x |
+| memoizee | 8,662,193 ops/s | 1.35x |
+| **memoza** | **8,614,776 ops/s** | **1.35x** |
+| @formatjs/fast-memoize | 3,522,986 ops/s | 3.31x |
 
 ### Single object argument by value — hot cache hits
 
@@ -111,11 +111,11 @@ Every call receives a fresh object with the same structural value. Other librari
 
 | Library | Handles all types | Zero config | Median throughput | vs fastest |
 |---|:---:|:---:|---|---|
-| lodash.memoize (resolver) | ❌ | ❌ | 4,786,226 ops/s | 1.00x |
-| memoize (cacheKey: JSON.stringify) | ❌ | ❌ | 4,737,474 ops/s | 1.01x |
-| @formatjs/fast-memoize | ❌ | ❌ | 1,762,212 ops/s | 2.72x |
-| memoizee (normalizer: JSON.stringify) | ❌ | ❌ | 1,601,978 ops/s | 2.99x |
-| **memoza** | ✅ | ✅ | **672,664 ops/s** | **7.12x** |
+| lodash.memoize (resolver) | ❌ | ❌ | 6,898,856 ops/s | 1.00x |
+| memoize (cacheKey: JSON.stringify) | ❌ | ❌ | 6,854,664 ops/s | 1.01x |
+| **memoza** | ✅ | ✅ | **2,381,246 ops/s** | **2.90x** |
+| @formatjs/fast-memoize | ❌ | ❌ | 2,320,900 ops/s | 2.97x |
+| memoizee (normalizer: JSON.stringify) | ❌ | ❌ | 2,233,821 ops/s | 3.09x |
 
 The speed gap reflects the cost of doing this correctly. `JSON.stringify` silently drops `undefined`, conflates `NaN`/`Infinity`, and ignores `Map`/`Set` contents — it is fast precisely because it cuts corners. memoza pays the price of correctness once, at key-derivation time.
 
