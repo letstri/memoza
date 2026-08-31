@@ -1,3 +1,5 @@
+import type { MemoizedCacheEntry } from './memoize'
+import type { AnyFunction } from './utils'
 import { describe, expect, it, mock } from 'bun:test'
 import { clearMemoizeCache, getCacheStore, isMemoized, memoize } from './memoize'
 
@@ -10,6 +12,22 @@ describe('memoize', () => {
     expect(fn(5)).toBe(10)
     expect(fn(10)).toBe(20)
     expect(callback).toHaveBeenCalledTimes(2)
+  })
+
+  it('caches undefined results without recomputing', () => {
+    const callback = mock((_: number) => undefined)
+    const fn = memoize(callback)
+
+    expect(fn(1)).toBeUndefined()
+    expect(fn(1)).toBeUndefined()
+    expect(callback).toHaveBeenCalledTimes(1)
+
+    const objCallback = mock((_: { a: number }) => undefined)
+    const objFn = memoize(objCallback)
+
+    expect(objFn({ a: 1 })).toBeUndefined()
+    expect(objFn({ a: 1 })).toBeUndefined()
+    expect(objCallback).toHaveBeenCalledTimes(1)
   })
 
   it('supports multiple object arguments by structural equality', () => {
@@ -353,7 +371,7 @@ describe('memoize', () => {
         expect(await fn(1)).toBe('v1')
         expect(callback).toHaveBeenCalledTimes(2)
 
-        const pending = getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        const pending = (getCacheStore(fn)!.primitiveCache.get(1) as MemoizedCacheEntry<AnyFunction>).pending
         resolvers[1]!('v2')
         await pending
 
@@ -387,11 +405,11 @@ describe('memoize', () => {
 
         now += 101
         expect(await fn(1)).toBe('v1')
-        await getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        await (getCacheStore(fn)!.primitiveCache.get(1) as MemoizedCacheEntry<AnyFunction>).pending
         expect(onError).toHaveBeenCalledTimes(1)
 
         expect(await fn(1)).toBe('v1')
-        await getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        await (getCacheStore(fn)!.primitiveCache.get(1) as MemoizedCacheEntry<AnyFunction>).pending
         expect(onError).toHaveBeenCalledTimes(2)
         expect(callback).toHaveBeenCalledTimes(3)
 
@@ -420,7 +438,7 @@ describe('memoize', () => {
         })
         const fn = memoize(callback, { maxAge: 100, stale: true, onError })
         // Two primitive args live in the args trie: arity root -> first arg -> leaf.
-        const leaf = () => getCacheStore(fn)!.argsTries.get(2)!.children!.get(1)!.entries!.get(2)!
+        const leaf = () => getCacheStore(fn)!.argsTries.get(2)!.children!.get(1)!.entries!.get(2) as MemoizedCacheEntry<AnyFunction>
 
         expect(await fn(1, 2)).toBe('v1')
 
@@ -467,7 +485,7 @@ describe('memoize', () => {
         // 30ms past expiry — inside the window.
         now += 130
         expect(await fn(1)).toBe('v1')
-        await getCacheStore(fn)!.primitiveCache.get(1)!.pending // 'v2' stored at now=130
+        await (getCacheStore(fn)!.primitiveCache.get(1) as MemoizedCacheEntry<AnyFunction>).pending // 'v2' stored at now=130
 
         // 51ms past expiry — outside the window, so the call blocks on the refresh.
         now += 151
@@ -500,7 +518,7 @@ describe('memoize', () => {
         // 20ms past expiry — inside the window.
         now += 120
         expect(await fn(1)).toBe('v1')
-        await getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        await (getCacheStore(fn)!.primitiveCache.get(1) as MemoizedCacheEntry<AnyFunction>).pending
         expect(onError).toHaveBeenCalledTimes(1)
 
         // 100ms past expiry — outside the window.
