@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test'
-import { clearMemoizeCache, getCacheStore, memoize } from './memoize'
+import { clearMemoizeCache, getCacheStore, isMemoized, memoize } from './memoize'
 
 describe('memoize', () => {
   it('caches results for equal arguments and recomputes for different ones', () => {
@@ -323,6 +323,304 @@ describe('memoize', () => {
       expect(() => fn(cyclic)).not.toThrow()
       expect(fn(cyclic)).toBe(1)
       expect(callback).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('stale option', () => {
+    it('serves the stale value immediately and refreshes once in the background', async () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        const resolvers: ((value: string) => void)[] = []
+        const callback = mock(
+          (_: number) => new Promise<string>((resolve) => { resolvers.push(resolve) }),
+        )
+        const fn = memoize(callback, { maxAge: 100, stale: true })
+
+        const first = fn(1)
+        resolvers[0]!('v1')
+        expect(await first).toBe('v1')
+        expect(callback).toHaveBeenCalledTimes(1)
+        expect(isMemoized(fn)).toBe(true)
+
+        now += 101
+        const staleHit = fn(1)
+        expect(callback).toHaveBeenCalledTimes(2)
+        expect(await staleHit).toBe('v1')
+
+        expect(await fn(1)).toBe('v1')
+        expect(callback).toHaveBeenCalledTimes(2)
+
+        const pending = getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        resolvers[1]!('v2')
+        await pending
+
+        expect(await fn(1)).toBe('v2')
+        expect(callback).toHaveBeenCalledTimes(2)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
+
+    it('keeps serving the stale value across failing refreshes', async () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+      const unhandled = mock(() => {})
+      process.on('unhandledRejection', unhandled)
+
+      try {
+        const onError = mock(() => {})
+        let calls = 0
+        const callback = mock(async (_: number) => {
+          calls++
+          if (calls === 1)
+            return 'v1'
+          throw new Error(`fail${calls}`)
+        })
+        const fn = memoize(callback, { maxAge: 100, stale: true, onError })
+
+        expect(await fn(1)).toBe('v1')
+
+        now += 101
+        expect(await fn(1)).toBe('v1')
+        await getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        expect(onError).toHaveBeenCalledTimes(1)
+
+        expect(await fn(1)).toBe('v1')
+        await getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        expect(onError).toHaveBeenCalledTimes(2)
+        expect(callback).toHaveBeenCalledTimes(3)
+
+        await new Promise(resolve => setTimeout(resolve, 0))
+        expect(unhandled).not.toHaveBeenCalled()
+      }
+      finally {
+        process.off('unhandledRejection', unhandled)
+        Date.now = dateNow
+      }
+    })
+
+    it('retains the value after a failed refresh so the next call retries', async () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        const onError = mock(() => {})
+        let calls = 0
+        const callback = mock(async (_a: number, _b: number) => {
+          calls++
+          if (calls === 2)
+            throw new Error('fail')
+          return `v${calls}`
+        })
+        const fn = memoize(callback, { maxAge: 100, stale: true, onError })
+        // Two primitive args live in the args trie: arity root -> first arg -> leaf.
+        const leaf = () => getCacheStore(fn)!.argsTries.get(2)!.children!.get(1)!.entries!.get(2)!
+
+        expect(await fn(1, 2)).toBe('v1')
+
+        now += 101
+        expect(await fn(1, 2)).toBe('v1')
+        await leaf().pending
+        expect(onError).toHaveBeenCalledTimes(1)
+        expect(leaf()).toBeDefined()
+
+        expect(await fn(1, 2)).toBe('v1')
+        await leaf().pending
+        expect(await fn(1, 2)).toBe('v3')
+        expect(callback).toHaveBeenCalledTimes(3)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
+
+    it('still rejects and evicts on a cold cache', async () => {
+      const callback = mock(async (_: number) => {
+        throw new Error('boom')
+      })
+      const fn = memoize(callback, { maxAge: 100, stale: true })
+
+      await expect(fn(1)).rejects.toThrow('boom')
+      expect(getCacheStore(fn)!.primitiveCache.size).toBe(0)
+      await expect(fn(1)).rejects.toThrow('boom')
+      expect(callback).toHaveBeenCalledTimes(2)
+    })
+
+    it('numeric bound: beyond the window callers block on a fresh computation', async () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        let calls = 0
+        const callback = mock(async (_: number) => `v${++calls}`)
+        const fn = memoize(callback, { maxAge: 100, stale: 50 })
+
+        expect(await fn(1)).toBe('v1')
+
+        // 30ms past expiry — inside the window.
+        now += 130
+        expect(await fn(1)).toBe('v1')
+        await getCacheStore(fn)!.primitiveCache.get(1)!.pending // 'v2' stored at now=130
+
+        // 51ms past expiry — outside the window, so the call blocks on the refresh.
+        now += 151
+        expect(await fn(1)).toBe('v3')
+        expect(callback).toHaveBeenCalledTimes(3)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
+
+    it('numeric bound: beyond the window a rejection propagates and evicts', async () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        const onError = mock(() => {})
+        let calls = 0
+        const callback = mock(async (_: number) => {
+          calls++
+          if (calls === 1)
+            return 'v1'
+          throw new Error(`fail${calls}`)
+        })
+        const fn = memoize(callback, { maxAge: 100, stale: 50, onError })
+
+        expect(await fn(1)).toBe('v1')
+
+        // 20ms past expiry — inside the window.
+        now += 120
+        expect(await fn(1)).toBe('v1')
+        await getCacheStore(fn)!.primitiveCache.get(1)!.pending
+        expect(onError).toHaveBeenCalledTimes(1)
+
+        // 100ms past expiry — outside the window.
+        now += 80
+        await expect(fn(1)).rejects.toThrow('fail3')
+        expect(onError).toHaveBeenCalledTimes(1)
+        expect(getCacheStore(fn)!.primitiveCache.size).toBe(0)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
+
+    it('supports reference-identity keys', async () => {
+      class Point { constructor(public x: number) {} }
+
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        let calls = 0
+        const callback = mock(async (_: Point) => {
+          calls++
+          if (calls === 2)
+            throw new Error('fail')
+          return `v${calls}`
+        })
+        const fn = memoize(callback, { maxAge: 100, stale: true })
+        const point = new Point(1)
+
+        expect(await fn(point)).toBe('v1')
+
+        now += 101
+        expect(await fn(point)).toBe('v1')
+        await getCacheStore(fn)!.fallbackEntries[0]!.pending
+        expect(getCacheStore(fn)!.fallbackEntries.length).toBe(1)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
+
+    it('serves the stale value and recomputes synchronously for sync functions', () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        let calls = 0
+        const callback = mock((_: number) => `v${++calls}`)
+        const fn = memoize(callback, { maxAge: 100, stale: true })
+
+        expect(fn(1)).toBe('v1')
+
+        now += 101
+        expect(fn(1)).toBe('v1')
+        expect(callback).toHaveBeenCalledTimes(2)
+        expect(fn(1)).toBe('v2')
+        expect(callback).toHaveBeenCalledTimes(2)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
+
+    it('serves the previous value when a sync function throws', () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        const onError = mock(() => {})
+        let calls = 0
+        const callback = mock((_: number) => {
+          calls++
+          if (calls > 1)
+            throw new Error('fail')
+          return 'v1'
+        })
+        const fn = memoize(callback, { maxAge: 100, stale: true, onError })
+
+        expect(fn(1)).toBe('v1')
+
+        now += 101
+        expect(fn(1)).toBe('v1')
+        expect(onError).toHaveBeenCalledTimes(1)
+        expect(callback).toHaveBeenCalledTimes(2)
+      }
+      finally {
+        Date.now = dateNow
+      }
+    })
+
+    it('clearMemoizeCache drops retained stale values', async () => {
+      let now = 0
+      const dateNow = Date.now
+      Date.now = () => now
+
+      try {
+        let calls = 0
+        const callback = mock(async (_: number) => {
+          calls++
+          if (calls === 2)
+            throw new Error('fail')
+          return `v${calls}`
+        })
+        const fn = memoize(callback, { maxAge: 100, stale: true })
+
+        expect(await fn(1)).toBe('v1')
+
+        now += 101
+        clearMemoizeCache(fn)
+
+        await expect(fn(1)).rejects.toThrow('fail')
+        expect(callback).toHaveBeenCalledTimes(2)
+      }
+      finally {
+        Date.now = dateNow
+      }
     })
   })
 

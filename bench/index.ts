@@ -5,7 +5,7 @@ import { memoize as fastMemoize } from '@formatjs/fast-memoize'
 import lodashMemoize from 'lodash.memoize'
 import memoizePkg from 'memoize'
 import memoizee from 'memoizee'
-import { memoize as conarMemoize } from '../src/memoize'
+import { memoize as memoza } from '../src/memoize'
 
 const TRIALS = 5
 const WARMUP_ROUNDS = 10_000
@@ -39,8 +39,6 @@ function avg(values: number[]) {
   return total / values.length
 }
 
-// --- datasets -------------------------------------------------------------
-
 function stringDataset(size: number): [string][] {
   return Array.from({ length: size }, (_, i) => [`key-${i % 61}-${i}`])
 }
@@ -61,8 +59,6 @@ function clonedObjectDataset(size: number): [Obj][] {
   }])
 }
 
-// --- workloads ------------------------------------------------------------
-
 function stringWorkload(input: string) {
   let total = 0
   for (let i = 0; i < input.length; i++)
@@ -75,8 +71,6 @@ const tupleWorkload = (a: number, b: number) => (a * 31) ^ (b * 17)
 function objectWorkload(v: Obj) {
   return v.id * 101 + v.tag.length * 7 + (v.nested.even ? 1 : 0) + v.nested.score
 }
-
-// --- benchmark runner -----------------------------------------------------
 
 interface Competitor {
   name: string
@@ -190,10 +184,8 @@ function runMiss(title: string, competitors: Competitor[], dataset: unknown[][],
   printSuite(title, results, note)
 }
 
-// --- suites ---------------------------------------------------------------
-
 const unaryString: Competitor[] = [
-  { name: '@conar/memoize', factory: conarMemoize, workload: stringWorkload },
+  { name: 'memoza', factory: memoza, workload: stringWorkload },
   { name: 'memoize', factory: memoizePkg, workload: stringWorkload },
   { name: 'lodash.memoize', factory: lodashMemoize, workload: stringWorkload },
   { name: 'memoizee', factory: fn => memoizee(fn), workload: stringWorkload },
@@ -202,7 +194,7 @@ const unaryString: Competitor[] = [
 ]
 
 const variadic: Competitor[] = [
-  { name: '@conar/memoize', factory: conarMemoize, workload: tupleWorkload },
+  { name: 'memoza', factory: memoza, workload: tupleWorkload },
   { name: 'memoize (cacheKey: JSON.stringify)', factory: fn => memoizePkg(fn, { cacheKey: JSON.stringify }), workload: tupleWorkload },
   { name: 'lodash.memoize (resolver)', factory: fn => lodashMemoize(fn, (...args: unknown[]) => JSON.stringify(args)), workload: tupleWorkload },
   { name: 'memoizee', factory: fn => memoizee(fn), workload: tupleWorkload },
@@ -212,7 +204,7 @@ const variadic: Competitor[] = [
 const jsonStringify = JSON.stringify as (value: unknown) => string
 
 const structuralObject: Competitor[] = [
-  { name: '@conar/memoize', factory: conarMemoize, workload: objectWorkload },
+  { name: 'memoza', factory: memoza, workload: objectWorkload },
   { name: 'memoize (cacheKey: JSON.stringify)', factory: fn => memoizePkg(fn, { cacheKey: JSON.stringify }), workload: objectWorkload },
   { name: 'lodash.memoize (resolver)', factory: fn => lodashMemoize(fn, jsonStringify), workload: objectWorkload },
   { name: 'memoizee (normalizer: JSON.stringify)', factory: fn => memoizee(fn, { normalizer: jsonStringify }), workload: objectWorkload },
