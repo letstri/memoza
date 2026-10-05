@@ -21,6 +21,8 @@ add(1, 2) // from cache
 
 Failed promises are evicted, so the next call retries.
 
+`this` is passed through to the wrapped function but is not part of the cache key. Objects and functions that are keyed by reference are held weakly, so the cache never keeps them alive.
+
 ## Options
 
 ```ts
@@ -47,22 +49,28 @@ Sync functions work with `stale` too: a stale hit returns the previous value whi
 import { clearMemoizeCache, getCacheStore, isMemoized } from 'memoza'
 
 isMemoized(fn) // true if fn was created with memoize()
-getCacheStore(fn) // { cache, primitiveCache, argsTries, fallbackEntries } or null
+getCacheStore(fn) // { cache, primitiveCache, refCache, argsTries } or null
 clearMemoizeCache(fn) // clears everything, including retained stale values
 ```
 
 ## Benchmark
 
-Bun 1.4.0, Apple M2 Pro, median of 7 trials. Each library runs in its own process. Run it yourself with `bun bench/index.ts`.
+Bun 1.4.2, Apple M2 Pro, median of 7 trials. Each library runs in its own process. Run it yourself with `bun bench/index.ts`.
 
-| Workload | memoza | Next fastest |
+| Workload | memoza | Best rival |
 |---|---|---|
-| Unary string, hot cache | **126,773,467 ops/s** | @emotion/memoize — 1.08x slower |
-| Unary string, cold misses | 9,029,957 ops/s | @emotion/memoize — 1.03x faster (noise) |
-| Two primitives, hot cache | **67,701,584 ops/s** | memoizee — 4.59x slower |
-| Object by value, hot cache | 2,968,792 ops/s | lodash.memoize — 2.38x faster |
+| Unary string, hot cache | **117,000,930 ops/s** | @emotion/memoize — tie |
+| Unary string, cold misses | **12,354,324 ops/s** | memoize — tie |
+| Two primitives, hot cache | **63,173,220 ops/s** | memoizee — 4.30x slower |
+| Three primitives, hot cache | **27,946,683 ops/s** | memoize — 2.55x slower |
+| No arguments, hot cache | 55,573,443 ops/s | memoizee — 1.81x faster |
+| Class instance, hot cache | 47,251,798 ops/s | lodash.memoize — 1.78x faster |
+| Unary string with `maxAge`, hot cache | 25,473,481 ops/s | memoize — 1.32x faster |
+| Object by value, hot cache | 5,022,045 ops/s | lodash.memoize — 1.43x faster |
+| Primitive + options object, hot cache | 6,642,768 ops/s | memoize — 1.48x faster |
+| Object by value, cold misses | 3,673,544 ops/s | memoize — 1.53x faster |
 
-Rivals need `JSON.stringify` resolvers for the last two workloads; memoza needs no configuration. It also loses the object-by-value row on purpose: `JSON.stringify` is fast because it drops `undefined`, conflates `NaN`/`Infinity`, and ignores `Map`/`Set` contents. memoza keys those correctly, along with `Date`, `RegExp`, `BigInt`, cyclic objects, and class instances.
+Rivals need `JSON.stringify` resolvers for multi-argument and by-value workloads; memoza needs no configuration. It trails on the by-value rows on purpose: a bare `JSON.stringify` drops `undefined`, conflates `NaN`/`Infinity`/`null` and `-0`/`0`, and ignores `Map`/`Set` contents. memoza uses `JSON.stringify` only when the value has none of those, and keys the rest correctly, along with `Date`, `RegExp`, `BigInt`, cyclic objects, and class instances.
 
 ## License
 

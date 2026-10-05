@@ -2,10 +2,12 @@ import { stringify } from 'devalue'
 
 export const BY_REFERENCE = Symbol('memoize-by-reference')
 
-function getPrimitiveCacheKey(value: unknown): string | null | typeof BY_REFERENCE {
-  if (value === null)
-    return 'l'
+function isPlainObject(value: object): value is Record<string, unknown> {
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
+}
 
+function getStructuralCacheKey(value: unknown): string | typeof BY_REFERENCE {
   switch (typeof value) {
     case 'undefined':
       return 'u'
@@ -17,49 +19,8 @@ function getPrimitiveCacheKey(value: unknown): string | null | typeof BY_REFEREN
       // The length prefix keeps concatenated structural keys unambiguous.
       return `s${value.length}:${value}`
     case 'number':
-      if (Number.isNaN(value))
-        return 'nNaN'
-      if (value === Number.POSITIVE_INFINITY)
-        return 'n+Inf'
-      if (value === Number.NEGATIVE_INFINITY)
-        return 'n-Inf'
-      if (Object.is(value, -0))
-        return 'n-0'
-      return `n${value}`
-    case 'object':
-      return null
-    default:
-      return BY_REFERENCE
-  }
-}
-
-function isPlainObject(value: object): value is Record<string, unknown> {
-  const prototype = Object.getPrototypeOf(value)
-  return prototype === Object.prototype || prototype === null
-}
-
-// Duplicates getPrimitiveCacheKey so the hot structural loops skip a call
-// and a null-sentinel check per value.
-function getStructuralCacheKey(value: unknown): string | typeof BY_REFERENCE {
-  switch (typeof value) {
-    case 'undefined':
-      return 'u'
-    case 'boolean':
-      return value ? 'b1' : 'b0'
-    case 'bigint':
-      return `i${value}`
-    case 'string':
-      return `s${value.length}:${value}`
-    case 'number':
-      if (Number.isNaN(value))
-        return 'nNaN'
-      if (value === Number.POSITIVE_INFINITY)
-        return 'n+Inf'
-      if (value === Number.NEGATIVE_INFINITY)
-        return 'n-Inf'
-      if (Object.is(value, -0))
-        return 'n-0'
-      return `n${value}`
+      // NaN and ±Infinity already stringify uniquely; only -0 would turn into "0".
+      return Object.is(value, -0) ? 'n-0' : `n${value}`
     case 'object':
       return value === null ? 'l' : walkStructural(value)
     default:
@@ -97,6 +58,10 @@ function walkStructural(objectValue: object): string | typeof BY_REFERENCE {
   }
 
   if (isPlainObject(objectValue)) {
+    // `Object.keys` skips symbol keys, and those only compare by identity.
+    if (Object.getOwnPropertySymbols(objectValue).length > 0)
+      return BY_REFERENCE
+
     stack.push(objectValue)
     const keys = Object.keys(objectValue)
     let key = `o${keys.length}|`
@@ -158,6 +123,14 @@ function walkStructural(objectValue: object): string | typeof BY_REFERENCE {
     return `${key})`
   }
 
+  // Class instances: devalue rejects them anyway, and a throw per call is
+  // slow. A null grandparent prototype means a plain object from another
+  // realm, which devalue can still handle.
+  if (Object.prototype.toString.call(objectValue) === '[object Object]'
+    && Object.getPrototypeOf(Object.getPrototypeOf(objectValue)) !== null) {
+    return BY_REFERENCE
+  }
+
   try {
     return stringify(objectValue)
   }
@@ -179,62 +152,61 @@ function withStack(value: object): string | typeof BY_REFERENCE {
   }
 }
 
+// True when `JSON.stringify` keys the value exactly: plain objects and
+// arrays of strings, booleans, null and finite numbers other than -0.
+// Native stringify is much faster than building the key by hand. Deep
+// nesting (or a cycle) bails out to the structural walk.
+function isJsonSafe(value: unknown, depth: number): boolean {
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return true
+    case 'number':
+      return Number.isFinite(value) && (value !== 0 || 1 / value > 0)
+    case 'object':
+      break
+    default:
+      return false
+  }
+
+  if (value === null)
+    return true
+
+  if (depth > 32)
+    return false
+
+  if (Array.isArray(value)) {
+    // Holes read as undefined, so they bail out too.
+    for (let index = 0; index < value.length; index++) {
+      if (!isJsonSafe(value[index], depth + 1))
+        return false
+    }
+    return true
+  }
+
+  if (!isPlainObject(value) || Object.getOwnPropertySymbols(value).length > 0)
+    return false
+
+  for (const propertyKey in value) {
+    if (!isJsonSafe(value[propertyKey], depth + 1))
+      return false
+  }
+  return true
+}
+
 export function getCacheKey(value: unknown): string | typeof BY_REFERENCE {
   // No length prefix here — nothing is concatenated after a top-level key.
   if (typeof value === 'string')
     return `s${value}`
 
-  if (typeof value === 'object' && value !== null)
-    return withStack(value)
+  if (typeof value !== 'object' || value === null)
+    return getStructuralCacheKey(value)
 
-  const primitiveKey = getPrimitiveCacheKey(value)
-  // `null` marks non-null objects, which were already handled above.
-  return primitiveKey === null ? BY_REFERENCE : primitiveKey
+  return isJsonSafe(value, 0) ? `j${JSON.stringify(value)}` : withStack(value)
 }
 
 export function getArgsCacheKey(params: unknown[]): string | typeof BY_REFERENCE {
-  let key = `[${params.length}|`
-
-  for (let index = 0; index < params.length; index++) {
-    const primitiveKey = getPrimitiveCacheKey(params[index])
-    if (primitiveKey === BY_REFERENCE)
-      return BY_REFERENCE
-
-    if (primitiveKey === null)
-      return withStack(params)
-
-    key += primitiveKey
-    key += ','
-  }
-
-  return `${key}]`
-}
-
-export function findReferenceEntry<T extends { key: unknown }>(
-  entries: T[],
-  key: unknown,
-): T | undefined {
-  for (const entry of entries) {
-    if (entry.key === key)
-      return entry
-
-    if (Array.isArray(entry.key) && Array.isArray(key)) {
-      if (entry.key.length !== key.length)
-        continue
-
-      let isEqual = true
-
-      for (let index = 0; index < key.length; index++) {
-        if (entry.key[index] !== key[index]) {
-          isEqual = false
-          break
-        }
-      }
-
-      if (isEqual)
-        return entry
-    }
-  }
-
-  return undefined
+  const key = isJsonSafe(params, 0) ? `j${JSON.stringify(params)}` : withStack(params)
+  // The prefix keeps `fn(a, b)` apart from `fn([a, b])`.
+  return key === BY_REFERENCE ? key : `a${key}`
 }

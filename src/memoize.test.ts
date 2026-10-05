@@ -263,12 +263,12 @@ describe('memoize', () => {
 
       const store = getCacheStore(fn)!
       expect(store.cache.size).toBe(1)
-      expect(store.fallbackEntries.length).toBe(1)
+      expect(store.refCache.has(pointRef)).toBe(true)
 
       clearMemoizeCache(fn)
 
       expect(store.cache.size).toBe(0)
-      expect(store.fallbackEntries.length).toBe(0)
+      expect(store.refCache.has(pointRef)).toBe(false)
     })
   })
 
@@ -285,6 +285,38 @@ describe('memoize', () => {
       fn('null')
       fn(undefined)
       expect(callback).toHaveBeenCalledTimes(6)
+    })
+
+    it('keys values that JSON.stringify would conflate apart', () => {
+      // eslint-disable-next-line ts/no-explicit-any
+      const callback = mock((..._: any[]) => 'ok')
+      const fn = memoize(callback)
+      const date = new Date(0)
+      const variants = [
+        [{}, { a: undefined }],
+        [[null], [Number.NaN], [Number.POSITIVE_INFINITY], [undefined]],
+        [{ a: 0 }, { a: -0 }],
+        [{ d: date }, { d: date.toISOString() }],
+        [{ m: new Map([[1, 2]]) }, { m: {} }],
+      ]
+
+      let expected = 0
+      for (const group of variants) {
+        for (const value of group) {
+          fn(value)
+          fn(1, value)
+          expected += 2
+        }
+      }
+      expect(callback).toHaveBeenCalledTimes(expected)
+
+      for (const group of variants) {
+        for (const value of group) {
+          fn(structuredClone(value))
+          fn(1, structuredClone(value))
+        }
+      }
+      expect(callback).toHaveBeenCalledTimes(expected)
     })
 
     it('treats NaN as equal to itself', () => {
@@ -326,7 +358,7 @@ describe('memoize', () => {
       expect(callback).toHaveBeenCalledTimes(N)
       const store = getCacheStore(fn)!
       expect(store.cache.size).toBe(N)
-      expect(store.fallbackEntries.length).toBe(0)
+      expect(store.primitiveCache.size).toBe(0)
     })
 
     it('handles cyclic keys via devalue without crashing', () => {
@@ -554,8 +586,10 @@ describe('memoize', () => {
 
         now += 101
         expect(await fn(point)).toBe('v1')
-        await getCacheStore(fn)!.fallbackEntries[0]!.pending
-        expect(getCacheStore(fn)!.fallbackEntries.length).toBe(1)
+        const { refCache } = getCacheStore(fn)!
+        // eslint-disable-next-line ts/no-explicit-any
+        await (refCache.get(point) as any).pending
+        expect(refCache.has(point)).toBe(true)
       }
       finally {
         Date.now = dateNow
@@ -672,5 +706,73 @@ describe('memoize', () => {
       fn(() => 1)
       expect(callback).toHaveBeenCalledTimes(2)
     })
+
+    it('compares array keys item by item', () => {
+      const shared = () => 1
+      // eslint-disable-next-line ts/no-explicit-any
+      const callback = mock((..._: any[]) => 'ok')
+      const fn = memoize(callback)
+
+      fn([shared, 1])
+      fn([shared, 1])
+      expect(callback).toHaveBeenCalledTimes(1)
+
+      fn(shared, Number.NaN)
+      fn(shared, Number.NaN)
+      expect(callback).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it('forwards `this` to the wrapped function', () => {
+    const fn = memoize(function (this: { x: number }, y: number) {
+      return this.x + y
+    })
+
+    expect(fn.call({ x: 1 }, 2)).toBe(3)
+    expect(fn.call({ x: 1 }, 5)).toBe(6)
+  })
+
+  it('does not keep reference keys alive', async () => {
+    class Point { constructor(public x: number) {} }
+    const fn = memoize((p: Point, n: number) => p.x + n)
+    const single = memoize((p: Point) => p.x)
+    const refs: WeakRef<Point>[] = []
+
+    ;(() => {
+      for (let i = 0; i < 10; i++) {
+        const p = new Point(i)
+        refs.push(new WeakRef(p))
+        fn(p, i)
+        single(p)
+      }
+    })()
+
+    await Bun.sleep(0)
+    Bun.gc(true)
+    expect(refs.filter(ref => ref.deref() !== undefined).length).toBeLessThan(10)
+  })
+
+  it('does not ignore symbol-keyed properties', () => {
+    const callback = mock((_: object) => 'ok')
+    const fn = memoize(callback)
+
+    fn({})
+    fn({ [Symbol('a')]: 1 })
+    expect(callback).toHaveBeenCalledTimes(2)
+  })
+
+  it('never mixes up an argument list with a single array argument', () => {
+    const shared = () => 1
+    // eslint-disable-next-line ts/no-explicit-any
+    const callback = mock((..._: any[]) => 'ok')
+    const fn = memoize(callback)
+
+    fn()
+    fn([])
+    fn(1, { a: 1 })
+    fn([1, { a: 1 }])
+    fn(shared, 1)
+    fn([shared, 1])
+    expect(callback).toHaveBeenCalledTimes(6)
   })
 })

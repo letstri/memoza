@@ -1,6 +1,5 @@
-import type { BY_REFERENCE } from './key'
 import type { AnyFunction } from './utils'
-import { findReferenceEntry, getArgsCacheKey, getCacheKey } from './key'
+import { BY_REFERENCE, getArgsCacheKey, getCacheKey } from './key'
 
 export interface MemoizeOptions<F extends AnyFunction> {
   /**
@@ -52,10 +51,6 @@ export interface MemoizedCacheEntry<F extends AnyFunction> {
   pending?: ReturnType<F>
 }
 
-export interface MemoizedEntry<F extends AnyFunction> extends MemoizedCacheEntry<F> {
-  key: unknown
-}
-
 /**
  * What the Map-backed stores hold. Without `maxAge` or `stale` there is no
  * per-entry bookkeeping, so results are stored raw; with either option each
@@ -64,6 +59,14 @@ export interface MemoizedEntry<F extends AnyFunction> extends MemoizedCacheEntry
 export type MemoizedCacheValue<F extends AnyFunction> = MemoizedCacheEntry<F> | ReturnType<F>
 
 const CACHE_SYMBOL = Symbol('memoize-cache')
+// Zero-arg calls key on this instead of building a string every time.
+const NO_ARGS = Symbol('memoize-no-args')
+
+// Objects and functions go in WeakMaps, so a cached call never keeps its
+// arguments alive.
+function isWeakKey(value: unknown): value is object {
+  return typeof value === 'function' || (typeof value === 'object' && value !== null)
+}
 
 function isDirectPrimitiveKey(value: unknown): boolean {
   const t = typeof value
@@ -73,16 +76,32 @@ function isDirectPrimitiveKey(value: unknown): boolean {
     || value === null
 }
 
+// `handleMap` only calls get/has/set/delete, which a WeakMap has too, so
+// weak stores are passed in under this type.
+type Slots<V> = Map<unknown, V>
+
 export interface CacheStore<F extends AnyFunction> {
   cache: Map<string, MemoizedCacheValue<F>>
+  /** Primitives and symbols, by value. */
   primitiveCache: Map<unknown, MemoizedCacheValue<F>>
+  /** Objects and functions that can only be keyed by reference. */
+  refCache: WeakMap<object, MemoizedCacheValue<F>>
+  /**
+   * Arg lists, one trie per arity. Negative roots hold array keys that can
+   * only be compared by reference, so `fn([a, b])` never hits `fn(a, b)`.
+   */
   argsTries: Map<number, ArgsTrieNode<F>>
-  fallbackEntries: MemoizedEntry<F>[]
 }
 
 export interface ArgsTrieNode<F extends AnyFunction> {
   children: Map<unknown, ArgsTrieNode<F>> | null
   entries: Map<unknown, MemoizedCacheValue<F>> | null
+  weakChildren: WeakMap<object, ArgsTrieNode<F>> | null
+  weakEntries: WeakMap<object, MemoizedCacheValue<F>> | null
+}
+
+function trieNode<F extends AnyFunction>(): ArgsTrieNode<F> {
+  return { children: null, entries: null, weakChildren: null, weakEntries: null }
 }
 
 export type MemoizedFn<F extends AnyFunction> = F & {
@@ -99,26 +118,24 @@ export function memoize<F extends AnyFunction>(
     stale = false,
     onError,
   } = options || {}
-  const cache = new Map<string, MemoizedCacheValue<F>>()
-  const primitiveCache = new Map<unknown, MemoizedCacheValue<F>>()
-  const argsTries = new Map<number, ArgsTrieNode<F>>()
-  const fallbackEntries: MemoizedEntry<F>[] = []
-  const hasMaxAge = maxAge !== Number.POSITIVE_INFINITY
-  // Without expiry or staleness there is nothing to track per entry, so the
-  // maps hold results directly — no wrapper to allocate on miss or chase on hit.
-  const direct = stale === false && !hasMaxAge
+  const store: CacheStore<F> = {
+    cache: new Map(),
+    primitiveCache: new Map(),
+    // Read through `store`: clearing swaps in a new one.
+    refCache: new WeakMap(),
+    argsTries: new Map(),
+  }
+  const { cache, primitiveCache, argsTries } = store
+  // Without expiry there is nothing to track per entry (and nothing ever
+  // goes stale), so the maps hold results directly — no wrapper to allocate
+  // on miss or chase on hit.
+  const direct = maxAge === Number.POSITIVE_INFINITY
   const staticKey = typeof cacheKey === 'string' ? getCacheKey(cacheKey) : undefined
   // `true` puts no bound on how stale a served value may be; `false` means an
   // expired entry is treated as absent, which is a window that nothing fits.
   const staleFor = stale === true
     ? Number.POSITIVE_INFINITY
     : stale === false ? Number.NEGATIVE_INFINITY : stale
-
-  const dropRefEntry = (entry: MemoizedCacheEntry<F>): void => {
-    const index = fallbackEntries.indexOf(entry as MemoizedEntry<F>)
-    if (index !== -1)
-      fallbackEntries.splice(index, 1)
-  }
 
   const dropOnReject = (result: unknown, drop: () => void): void => {
     if (result instanceof Promise)
@@ -128,22 +145,33 @@ export function memoize<F extends AnyFunction>(
   const withinStaleWindow = (storedAt: number): boolean =>
     Date.now() - storedAt - maxAge <= staleFor
 
-  const compute = (
+  const evict = (
+    map: Slots<MemoizedCacheValue<F>>,
+    key: unknown,
     entry: MemoizedCacheEntry<F>,
+  ): void => {
+    if (map.get(key) === entry)
+      map.delete(key)
+  }
+
+  const compute = (
+    map: Slots<MemoizedCacheValue<F>>,
+    key: unknown,
+    entry: MemoizedCacheEntry<F>,
+    self: unknown,
     params: Parameters<F>,
-    evict: (entry: MemoizedCacheEntry<F>) => void,
     background: boolean,
   ): ReturnType<F> => {
     let result
     try {
-      result = func(...params)
+      result = func.apply(self, params)
     }
     catch (error) {
       if (entry.storedAt !== undefined && withinStaleWindow(entry.storedAt)) {
         onError?.(error)
         return entry.value as ReturnType<F>
       }
-      evict(entry)
+      evict(map, key, entry)
       if (!background)
         throw error
       onError?.(error)
@@ -173,7 +201,7 @@ export function memoize<F extends AnyFunction>(
           onError?.(error)
           return entry.value
         }
-        evict(entry)
+        evict(map, key, entry)
         if (background)
           onError?.(error)
         throw error
@@ -189,14 +217,21 @@ export function memoize<F extends AnyFunction>(
     return pending
   }
 
+  // Map and key are passed down rather than wrapped in insert/evict
+  // closures, so a hit allocates nothing.
   const call = (
-    existing: MemoizedCacheEntry<F> | undefined,
+    map: Slots<MemoizedCacheValue<F>>,
+    key: unknown,
+    self: unknown,
     params: Parameters<F>,
-    insert: () => MemoizedCacheEntry<F>,
-    evict: (entry: MemoizedCacheEntry<F>) => void,
   ): ReturnType<F> => {
-    if (existing === undefined)
-      return compute(insert(), params, evict, false)
+    const existing = map.get(key) as MemoizedCacheEntry<F> | undefined
+    if (existing === undefined) {
+      // All fields up front, so every entry shares one shape.
+      const entry: MemoizedCacheEntry<F> = { value: undefined, storedAt: undefined, pending: undefined }
+      map.set(key, entry)
+      return compute(map, key, entry, self, params, false)
+    }
 
     if (existing.storedAt !== undefined) {
       const age = Date.now() - existing.storedAt
@@ -208,21 +243,22 @@ export function memoize<F extends AnyFunction>(
         // `existing.value` in the same tick.
         const staleValue = existing.value as ReturnType<F>
         if (existing.pending === undefined)
-          compute(existing, params, evict, true)
+          compute(map, key, existing, self, params, true)
 
         return staleValue
       }
     }
 
-    return existing.pending ?? compute(existing, params, evict, false)
+    return existing.pending ?? compute(map, key, existing, self, params, false)
   }
 
   const handleMap: (
-    map: Map<unknown, MemoizedCacheValue<F>>,
+    map: Slots<MemoizedCacheValue<F>>,
     key: unknown,
+    self: unknown,
     params: Parameters<F>,
   ) => ReturnType<F> = direct
-    ? (map, key, params) => {
+    ? (map, key, self, params) => {
         const cached = map.get(key)
         if (cached !== undefined)
           return cached as ReturnType<F>
@@ -232,7 +268,7 @@ export function memoize<F extends AnyFunction>(
         if (map.has(key))
           return undefined as ReturnType<F>
 
-        const result = func(...params)
+        const result = func.apply(self, params)
         map.set(key, result)
         dropOnReject(result, () => {
           if (map.get(key) === result)
@@ -241,114 +277,154 @@ export function memoize<F extends AnyFunction>(
 
         return result
       }
-    : (map, key, params) => call(
-        map.get(key) as MemoizedCacheEntry<F> | undefined,
-        params,
-        () => {
-          const entry: MemoizedCacheEntry<F> = {}
-          map.set(key, entry)
-          return entry
-        },
-        (entry) => {
-          if (map.get(key) === entry)
-            map.delete(key)
-        },
-      )
+    : call
 
-  const handleRef = (refKey: unknown, params: Parameters<F>): ReturnType<F> => call(
-    findReferenceEntry(fallbackEntries, refKey),
-    params,
-    () => {
-      const entry: MemoizedEntry<F> = { key: refKey }
-      fallbackEntries.push(entry)
-      return entry
-    },
-    dropRefEntry,
-  )
+  // Walks (and grows) the trie rooted at `root` down to the leaf map that
+  // holds `keys[keys.length - 1]`.
+  const handleArgs = (
+    root: number,
+    keys: unknown[],
+    self: unknown,
+    params: Parameters<F>,
+  ): ReturnType<F> => {
+    let node = argsTries.get(root)
+    if (node === undefined)
+      argsTries.set(root, node = trieNode())
 
-  const fn = ((...params: Parameters<F>) => {
-    let args: unknown
-    let key: string | typeof BY_REFERENCE
+    const last = keys.length - 1
+    for (let index = 0; index < last; index++) {
+      const key = keys[index]
+      const children = (isWeakKey(key)
+        ? node.weakChildren ??= new WeakMap()
+        : node.children ??= new Map()) as unknown as Slots<ArgsTrieNode<F>>
+      let next = children.get(key)
+      if (next === undefined)
+        children.set(key, next = trieNode())
+      node = next
+    }
 
-    if (cacheKey === undefined) {
-      if (params.length === 1) {
-        const arg = params[0]
-        // Inlined `isDirectPrimitiveKey`: on this, the hottest path, even the
-        // helper call shows up (~10%).
-        const t = typeof arg
-        if (t === 'string' || t === 'boolean' || t === 'bigint' || t === 'undefined'
-          || (t === 'number' && (arg !== 0 || 1 / (arg as number) > 0))
-          || arg === null) {
-          // Default mode also skips `handleMap`: routing through it costs
-          // ~30% on unary cache hits.
-          if (direct) {
-            const cached = primitiveCache.get(arg)
-            if (cached !== undefined)
-              return cached
+    const key = keys[last]
+    const entries = (isWeakKey(key)
+      ? node.weakEntries ??= new WeakMap()
+      : node.entries ??= new Map()) as unknown as Slots<MemoizedCacheValue<F>>
+    return handleMap(entries, key, self, params)
+  }
 
-            if (primitiveCache.has(arg))
-              return undefined
+  const handleValue = (value: unknown, self: unknown, params: Parameters<F>): ReturnType<F> => {
+    // Already keyed by reference (class instances, functions, …): skip the
+    // structural walk, which would only end at the same answer.
+    const refCache = store.refCache as unknown as Slots<MemoizedCacheValue<F>>
+    if (isWeakKey(value) && refCache.has(value))
+      return handleMap(refCache, value, self, params)
 
-            const result = func(...params)
-            primitiveCache.set(arg, result)
-            dropOnReject(result, () => {
-              if (primitiveCache.get(arg) === result)
-                primitiveCache.delete(arg)
-            })
+    const key = getCacheKey(value)
+    if (key !== BY_REFERENCE)
+      return handleMap(cache, key, self, params)
 
-            return result
-          }
+    // Arrays are compared item by item, so a fresh `[fn, 1]` still hits.
+    if (Array.isArray(value))
+      return handleArgs(~value.length, value, self, params)
 
-          return handleMap(primitiveCache, arg, params)
+    return isWeakKey(value)
+      ? handleMap(refCache, value, self, params)
+      : handleMap(primitiveCache, value, self, params)
+  }
+
+  const fn = function (this: unknown, ...params: Parameters<F>) {
+    if (cacheKey !== undefined) {
+      if (staticKey !== undefined)
+        return handleMap(cache, staticKey, this, params)
+
+      return handleValue((cacheKey as (...args: Parameters<F>) => unknown).apply(this, params), this, params)
+    }
+
+    if (params.length === 1) {
+      const arg = params[0]
+      // Inlined `isDirectPrimitiveKey`: on this, the hottest path, even the
+      // helper call shows up (~10%).
+      const t = typeof arg
+      if (t === 'string' || t === 'boolean' || t === 'bigint' || t === 'undefined'
+        || (t === 'number' && (arg !== 0 || 1 / (arg as number) > 0))
+        || arg === null) {
+        // Default mode also skips `handleMap`: routing through it costs
+        // ~30% on unary cache hits.
+        if (direct) {
+          const cached = primitiveCache.get(arg)
+          if (cached !== undefined)
+            return cached
+
+          if (primitiveCache.has(arg))
+            return undefined
+
+          const result = func.apply(this, params)
+          primitiveCache.set(arg, result)
+          dropOnReject(result, () => {
+            if (primitiveCache.get(arg) === result)
+              primitiveCache.delete(arg)
+          })
+
+          return result
         }
 
-        args = arg
-        key = getCacheKey(arg)
+        return handleMap(primitiveCache, arg, this, params)
       }
-      else {
-        if (params.length > 1 && params.every(isDirectPrimitiveKey)) {
-          // Trie roots are split by arity so an inner node and a leaf entry
-          // never share a slot.
-          let node = argsTries.get(params.length)
-          if (node === undefined) {
-            node = { children: null, entries: null }
-            argsTries.set(params.length, node)
-          }
 
-          const last = params.length - 1
-          for (let index = 0; index < last; index++) {
-            const children: Map<unknown, ArgsTrieNode<F>> = node.children ??= new Map()
-            let next = children.get(params[index])
-            if (next === undefined) {
-              next = { children: null, entries: null }
-              children.set(params[index], next)
-            }
-            node = next
-          }
+      // Inlined hit check from `handleValue` for reference keys.
+      if (direct) {
+        const cached = store.refCache.get(arg as object)
+        if (cached !== undefined)
+          return cached
+      }
 
-          return handleMap(node.entries ??= new Map(), params[last], params)
-        }
+      return handleValue(arg, this, params)
+    }
 
-        args = params
-        key = getArgsCacheKey(params)
+    if (params.length === 0) {
+      // Same shortcut as the unary path above.
+      if (direct) {
+        const cached = primitiveCache.get(NO_ARGS)
+        if (cached !== undefined || primitiveCache.has(NO_ARGS))
+          return cached
+      }
+
+      return handleMap(primitiveCache, NO_ARGS, this, params)
+    }
+
+    // A plain loop: `params.every` costs ~15-30% on multi-arg hits.
+    let allPrimitive = true
+    for (let index = 0; index < params.length; index++) {
+      if (!isDirectPrimitiveKey(params[index])) {
+        allPrimitive = false
+        break
       }
     }
-    else if (typeof cacheKey === 'function') {
-      args = cacheKey(...params)
-      key = getCacheKey(args)
+    // Trie roots are split by arity so an inner node and a leaf entry never
+    // share a slot. The walk is `handleArgs` inlined: the call costs ~15%
+    // on two-arg hits.
+    if (allPrimitive) {
+      let node = argsTries.get(params.length)
+      if (node === undefined)
+        argsTries.set(params.length, node = trieNode())
+
+      const last = params.length - 1
+      for (let index = 0; index < last; index++) {
+        const children: Map<unknown, ArgsTrieNode<F>> = node.children ??= new Map()
+        let next = children.get(params[index])
+        if (next === undefined)
+          children.set(params[index], next = trieNode())
+        node = next
+      }
+
+      return handleMap(node.entries ??= new Map(), params[last], this, params)
     }
-    else {
-      args = cacheKey
-      key = staticKey!
-    }
 
-    if (typeof key === 'string')
-      return handleMap(cache, key, params)
+    const key = getArgsCacheKey(params)
+    return key === BY_REFERENCE
+      ? handleArgs(params.length, params, this, params)
+      : handleMap(cache, key, this, params)
+  } as MemoizedFn<F>
 
-    return handleRef(args, params)
-  }) as MemoizedFn<F>
-
-  fn[CACHE_SYMBOL] = () => ({ cache, primitiveCache, argsTries, fallbackEntries })
+  fn[CACHE_SYMBOL] = () => store
 
   return fn
 }
@@ -373,5 +449,5 @@ export function clearMemoizeCache<F extends (...args: Parameters<F>) => ReturnTy
   store.cache.clear()
   store.primitiveCache.clear()
   store.argsTries.clear()
-  store.fallbackEntries.length = 0
+  store.refCache = new WeakMap()
 }
