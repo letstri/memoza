@@ -70,6 +70,59 @@ function makeObject(i: number): Obj {
 
 const jsonStringify = JSON.stringify as (value: unknown) => string
 
+class User {
+  constructor(public id: number, public name: string) {}
+}
+
+const users = Array.from({ length: HIT_DATASET_SIZE }, (_, i) => new User(i, `user-${i}`))
+const tripleKeys = Array.from({ length: HIT_DATASET_SIZE }, (_, i) => [i % 97, objectTags[i % 11]!, i % 2 === 0] as const)
+
+function userWorkload(user: User) {
+  return user.id * 31 + user.name.length
+}
+
+function tripleWorkload(a: number, b: string, c: boolean) {
+  return a * 31 + b.length * 7 + (c ? 1 : 0)
+}
+
+function mixedWorkload(id: number, options: { verbose: boolean, depth: number }) {
+  return id * 31 + options.depth + (options.verbose ? 1 : 0)
+}
+
+let zeroCalls = 0
+function zeroWorkload() {
+  return ++zeroCalls
+}
+
+// Warms up, then times `HIT_ROUNDS` passes over `count` calls.
+function timeHits(count: number, call: (i: number) => number) {
+  for (let r = 0; r < WARMUP_ROUNDS; r++)
+    blackhole(call(r % count))
+
+  let operations = 0
+  const start = performance.now()
+
+  for (let r = 0; r < HIT_ROUNDS; r++) {
+    for (let i = 0; i < count; i++) {
+      blackhole(call(i))
+      operations++
+    }
+  }
+
+  return { ms: performance.now() - start, operations }
+}
+
+// Times `count` calls that should all be cache misses.
+function timeMisses(count: number, call: (i: number) => number) {
+  const start = performance.now()
+  for (let i = 0; i < count; i++)
+    blackhole(call(i))
+
+  return { ms: performance.now() - start, operations: count }
+}
+
+const argsJson = (...args: unknown[]) => JSON.stringify(args)
+
 const SUITES: Record<string, Suite> = {
   'unary-hit': {
     title: 'Unary string argument — hot cache hits',
@@ -192,6 +245,109 @@ const SUITES: Record<string, Suite> = {
       }
 
       return { ms: performance.now() - start, operations }
+    },
+  },
+
+  'zero-arg': {
+    title: 'No arguments — hot cache hits',
+    note: 'A lazily computed singleton, called over and over.',
+    trials: HIT_TRIALS,
+    competitors: {
+      'memoza': { label: 'memoza', packageName: 'memoza', create: fn => memoza(fn) },
+      'memoize': { label: 'memoize', packageName: 'memoize', create: fn => memoizePkg(fn) },
+      'lodash': { label: 'lodash.memoize', packageName: 'lodash.memoize', create: fn => lodashMemoize(fn) },
+      'memoizee': { label: 'memoizee', packageName: 'memoizee', create: fn => memoizee(fn) },
+      'fast-memoize': { label: '@formatjs/fast-memoize', packageName: '@formatjs/fast-memoize', create: fn => fastMemoize(fn) },
+    },
+    trial: (create) => {
+      const memoized = create(zeroWorkload) as () => number
+      return timeHits(HIT_DATASET_SIZE, () => memoized())
+    },
+  },
+
+  'three-args': {
+    title: 'Three primitive arguments — hot cache hits',
+    note: 'number, string and boolean. Libraries that need custom keying use JSON.stringify.',
+    trials: HIT_TRIALS,
+    competitors: {
+      'memoza': { label: 'memoza', packageName: 'memoza', create: fn => memoza(fn) },
+      'memoize': { label: 'memoize (cacheKey: JSON.stringify)', packageName: 'memoize', create: fn => memoizePkg(fn, { cacheKey: jsonStringify }) },
+      'lodash': { label: 'lodash.memoize (resolver)', packageName: 'lodash.memoize', create: fn => lodashMemoize(fn, argsJson) },
+      'memoizee': { label: 'memoizee', packageName: 'memoizee', create: fn => memoizee(fn) },
+      'fast-memoize': { label: '@formatjs/fast-memoize', packageName: '@formatjs/fast-memoize', create: fn => fastMemoize(fn) },
+    },
+    trial: (create) => {
+      const memoized = create(tripleWorkload) as typeof tripleWorkload
+      return timeHits(tripleKeys.length, (i) => {
+        const [a, b, c] = tripleKeys[i]!
+        return memoized(a, b, c)
+      })
+    },
+  },
+
+  'instance-hit': {
+    title: 'Class instance argument — hot cache hits',
+    note: 'Same instances every round, cached by reference. fast-memoize serialises them with JSON.stringify instead.',
+    trials: HIT_TRIALS,
+    competitors: {
+      'memoza': { label: 'memoza', packageName: 'memoza', create: fn => memoza(fn) },
+      'memoize': { label: 'memoize', packageName: 'memoize', create: fn => memoizePkg(fn) },
+      'lodash': { label: 'lodash.memoize', packageName: 'lodash.memoize', create: fn => lodashMemoize(fn) },
+      'memoizee': { label: 'memoizee', packageName: 'memoizee', create: fn => memoizee(fn) },
+      'fast-memoize': { label: '@formatjs/fast-memoize', packageName: '@formatjs/fast-memoize', create: fn => fastMemoize(fn) },
+    },
+    trial: (create) => {
+      const memoized = create(userWorkload) as typeof userWorkload
+      return timeHits(users.length, i => memoized(users[i]!))
+    },
+  },
+
+  'mixed-args': {
+    title: 'Primitive plus options object — hot cache hits',
+    note: 'Every call allocates a fresh options object; libraries are configured for by-value caching where needed.',
+    trials: HIT_TRIALS,
+    competitors: {
+      'memoza': { label: 'memoza', packageName: 'memoza', create: fn => memoza(fn) },
+      'memoize': { label: 'memoize (cacheKey: JSON.stringify)', packageName: 'memoize', create: fn => memoizePkg(fn, { cacheKey: jsonStringify }) },
+      'lodash': { label: 'lodash.memoize (resolver)', packageName: 'lodash.memoize', create: fn => lodashMemoize(fn, argsJson) },
+      'memoizee': { label: 'memoizee (normalizer: JSON.stringify)', packageName: 'memoizee', create: fn => memoizee(fn, { normalizer: jsonStringify }) },
+      'fast-memoize': { label: '@formatjs/fast-memoize', packageName: '@formatjs/fast-memoize', create: fn => fastMemoize(fn) },
+    },
+    trial: (create) => {
+      const memoized = create(mixedWorkload) as typeof mixedWorkload
+      return timeHits(HIT_DATASET_SIZE, i => memoized(i % 79, { verbose: i % 2 === 0, depth: i % 5 }))
+    },
+  },
+
+  'maxage-hit': {
+    title: 'Unary string argument with maxAge — hot cache hits',
+    note: 'Expiry enabled (1 hour), so every hit checks the entry age. Only libraries with maxAge support.',
+    trials: HIT_TRIALS,
+    competitors: {
+      memoza: { label: 'memoza', packageName: 'memoza', create: fn => memoza(fn, { maxAge: 3_600_000 }) },
+      memoize: { label: 'memoize', packageName: 'memoize', create: fn => memoizePkg(fn, { maxAge: 3_600_000 }) },
+      memoizee: { label: 'memoizee', packageName: 'memoizee', create: fn => memoizee(fn, { maxAge: 3_600_000 }) },
+    },
+    trial: (create) => {
+      const memoized = create(stringWorkload) as typeof stringWorkload
+      return timeHits(hitKeys.length, i => memoized(hitKeys[i]!))
+    },
+  },
+
+  'object-miss': {
+    title: 'Single object argument by value — cold misses',
+    note: 'Each call passes a new, unique object, so this reflects key derivation plus insertion.',
+    trials: MISS_TRIALS,
+    competitors: {
+      'memoza': { label: 'memoza', packageName: 'memoza', create: fn => memoza(fn) },
+      'memoize': { label: 'memoize (cacheKey: JSON.stringify)', packageName: 'memoize', create: fn => memoizePkg(fn, { cacheKey: jsonStringify }) },
+      'lodash': { label: 'lodash.memoize (resolver)', packageName: 'lodash.memoize', create: fn => lodashMemoize(fn, jsonStringify) },
+      'memoizee': { label: 'memoizee (normalizer: JSON.stringify)', packageName: 'memoizee', create: fn => memoizee(fn, { normalizer: jsonStringify }) },
+      'fast-memoize': { label: '@formatjs/fast-memoize', packageName: '@formatjs/fast-memoize', create: fn => fastMemoize(fn) },
+    },
+    trial: (create) => {
+      const memoized = create(objectWorkload) as typeof objectWorkload
+      return timeMisses(MISS_COUNT, i => memoized({ id: i, tag: objectTags[i % 11]!, nested: { even: i % 2 === 0, score: i % 17 } }))
     },
   },
 }
